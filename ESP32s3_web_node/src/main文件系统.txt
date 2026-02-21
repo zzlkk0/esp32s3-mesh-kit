@@ -1,0 +1,310 @@
+// === web_node/src/main.cpp ===
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include "esp_partition.h"
+
+static const int UART1_TX_PIN = 17;
+static const int UART1_RX_PIN = 18;
+
+const char* AP_SSID = "MeshWeb_AP";
+const char* AP_PASS = "12345678";
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+String pcBuf = "";
+String serverBuf = "";
+bool wasStaConnected = false;
+bool serverConnected = false;
+uint32_t lastPingTime = 0;
+uint32_t lastServerRxTime = 0;
+uint32_t lastPcRxTime = 0;
+
+static const char EMBEDDED_CONSOLE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mesh Console (Embedded)</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f5f7fb;color:#222;margin:0;padding:16px}
+.row{margin-bottom:10px}.ok{color:#14803d}.bad{color:#b42318}
+#log{height:60vh;overflow:auto;background:#111;color:#ddd;padding:10px;border-radius:8px;font-family:Consolas,monospace;font-size:12px}
+button{padding:8px 12px;border:0;border-radius:6px;background:#1677ff;color:#fff}
+</style></head><body>
+<h3>Mesh Web Console (Embedded)</h3>
+<div class="row">WS: <span id="ws" class="bad">disconnected</span></div>
+<div class="row"><button onclick="sendList()">Send list</button></div>
+<div id="log"></div>
+<script>
+const logEl=document.getElementById('log'); const wsEl=document.getElementById('ws');
+function log(s){logEl.textContent+=s+"\\n"; logEl.scrollTop=logEl.scrollHeight;}
+const ws=new WebSocket(`ws://${location.hostname}/ws`);
+ws.onopen=()=>{wsEl.textContent='connected';wsEl.className='ok';log('[WS] connected')};
+ws.onclose=()=>{wsEl.textContent='disconnected';wsEl.className='bad';log('[WS] disconnected')};
+ws.onmessage=(e)=>log('[RX] '+e.data);
+function sendList(){ if(ws.readyState===1) ws.send(JSON.stringify({cmd:'list'})); }
+</script></body></html>
+)HTML";
+
+static void logSpiffsFiles() {
+  File root = SPIFFS.open("/");
+  if (!root || !root.isDirectory()) {
+    Serial.println("[SPIFFS] Root open failed.");
+    return;
+  }
+  File f = root.openNextFile();
+  while (f) {
+    Serial.printf("[SPIFFS] %s (%u bytes)\n", f.name(), (unsigned)f.size());
+    f = root.openNextFile();
+  }
+}
+
+static String readFileHead(const char* path, size_t maxLen) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) return String("OPEN_FAIL");
+  String out = "";
+  size_t n = 0;
+  while (f.available() && n < maxLen) {
+    char c = (char)f.read();
+    if (c == '\r') continue;
+    out += c;
+    n++;
+  }
+  return out;
+}
+
+static String readFileHeadHex(const char* path, size_t maxLen) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) return String("OPEN_FAIL");
+  String out = "";
+  size_t n = 0;
+  while (f.available() && n < maxLen) {
+    uint8_t b = (uint8_t)f.read();
+    if (n) out += ' ';
+    if (b < 16) out += '0';
+    out += String(b, HEX);
+    n++;
+  }
+  out.toUpperCase();
+  return out;
+}
+
+void setupWiFiAP() {
+  WiFi.disconnect(true);
+
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    (void)event;
+    (void)info;
+    Serial.println("\n[WiFi] New device connected to AP!");
+  }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    (void)event;
+    (void)info;
+    Serial.println("\n[WiFi] Device disconnected from AP.");
+  }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.println("\n[WiFi] AP Mode Started");
+  Serial.print("[WiFi] IP Address: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setupWiFiSTA(String ssid, String pass) {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  wasStaConnected = false;
+  Serial.printf("\n[WiFi] Connecting to Router: %s ...\n", ssid.c_str());
+}
+
+void onEvent(AsyncWebSocket* wsServer, AsyncWebSocketClient* client, AwsEventType type,
+             void* arg, uint8_t* data, size_t len) {
+  (void)wsServer;
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("[WS] Client connected. ID: %u\n", client->id());
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("[WS] Client disconnected.\n");
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      String msg((const char*)data, len);
+      Serial1.println(msg);
+    }
+  }
+}
+
+void handlePcInput(String line) {
+  line.trim();
+  if (!line.length()) return;
+  if (line.startsWith("wifi ")) {
+    if (line == "wifi ap") setupWiFiAP();
+    else if (line.startsWith("wifi sta ")) {
+      int s1 = line.indexOf(' ', 5);
+      int s2 = line.indexOf(' ', s1 + 1);
+      if (s1 > 0 && s2 > 0) setupWiFiSTA(line.substring(s1 + 1, s2), line.substring(s2 + 1));
+    }
+    return;
+  }
+  Serial1.println(line);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(UART1_RX_PIN, INPUT_PULLUP);
+  Serial1.begin(115200, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
+  delay(50);
+  Serial1.flush();
+  Serial1.print("\n\n\n");
+
+  delay(1000);
+  Serial.println("\n\n====================================");
+  Serial.println("  Web Dashboard Gateway Started ");
+  Serial.println("====================================");
+
+  setupWiFiAP();
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[Error] SPIFFS Mount Failed!");
+    return;
+  }
+  Serial.println("[System] SPIFFS Mount Successful!");
+  logSpiffsFiles();
+  Serial.printf("[SPIFFS] /web/index.html exists=%d\n", SPIFFS.exists("/web/index.html"));
+  Serial.printf("[SPIFFS] /web/style.css exists=%d\n", SPIFFS.exists("/web/style.css"));
+  Serial.printf("[SPIFFS] /web/script.js exists=%d\n", SPIFFS.exists("/web/script.js"));
+
+  // 对齐成功样例的 web 方式：WebSocket 先注册，再静态文件映射到 /web
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+  server.serveStatic("/", SPIFFS, "/web")
+        .setDefaultFile("index.html")
+        .setCacheControl("no-cache");
+
+  // favicon 兜底，避免浏览器重复请求干扰
+  server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "image/x-icon", "");
+  });
+
+  // 诊断页：不依赖 SPIFFS
+  server.on("/diag", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/html; charset=utf-8", EMBEDDED_CONSOLE_HTML);
+  });
+
+  // 文件系统诊断
+  server.on("/fsdiag", HTTP_GET, [](AsyncWebServerRequest* request) {
+    StaticJsonDocument<1024> doc;
+    doc["ok"] = true;
+    doc["web_index_exists"] = SPIFFS.exists("/web/index.html");
+    doc["web_style_exists"] = SPIFFS.exists("/web/style.css");
+    doc["web_script_exists"] = SPIFFS.exists("/web/script.js");
+
+    if (doc["web_index_exists"]) {
+      File f = SPIFFS.open("/web/index.html", "r");
+      doc["web_index_size"] = f ? (uint32_t)f.size() : 0;
+    }
+    if (doc["web_style_exists"]) {
+      File f = SPIFFS.open("/web/style.css", "r");
+      doc["web_style_size"] = f ? (uint32_t)f.size() : 0;
+    }
+    if (doc["web_script_exists"]) {
+      File f = SPIFFS.open("/web/script.js", "r");
+      doc["web_script_size"] = f ? (uint32_t)f.size() : 0;
+    }
+    doc["web_index_head"] = readFileHead("/web/index.html", 120);
+    doc["web_index_hex32"] = readFileHeadHex("/web/index.html", 32);
+    doc["web_style_hex32"] = readFileHeadHex("/web/style.css", 32);
+    doc["web_script_hex32"] = readFileHeadHex("/web/script.js", 32);
+
+    const esp_partition_t* p = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA,
+      ESP_PARTITION_SUBTYPE_DATA_SPIFFS,
+      nullptr
+    );
+    if (p) {
+      doc["spiffs_part_label"] = p->label;
+      doc["spiffs_part_addr"] = p->address;
+      doc["spiffs_part_size"] = p->size;
+    } else {
+      doc["spiffs_part_label"] = "NOT_FOUND";
+    }
+
+    String out;
+    serializeJsonPretty(doc, out);
+    request->send(200, "application/json; charset=utf-8", out);
+  });
+
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    Serial.printf("[HTTP] Warning: 404 Not Found -> %s\n", request->url().c_str());
+    request->send(404, "text/plain", "File Not Found");
+  });
+
+  server.begin();
+  Serial.println("[HTTP] Web Server is fully ready!");
+}
+
+void loop() {
+  uint32_t now = millis();
+  ws.cleanupClients();
+
+  while (Serial.available()) {
+    char c = Serial.read();
+    lastPcRxTime = now;
+    if (c == '\n' || c == '\r') {
+      if (pcBuf.length()) {
+        handlePcInput(pcBuf);
+        pcBuf = "";
+      }
+      continue;
+    }
+    if ((c >= 32 && c <= 126) || c == '{' || c == '}') pcBuf += c;
+    if (c == '}' && pcBuf.startsWith("{")) {
+      handlePcInput(pcBuf);
+      pcBuf = "";
+      continue;
+    }
+    if (pcBuf.length() > 512) pcBuf = "";
+  }
+  if (pcBuf.length() > 0 && (now - lastPcRxTime > 200)) {
+    handlePcInput(pcBuf);
+    pcBuf = "";
+  }
+
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n' || c == '\r') {
+      if (serverBuf.length() > 0) {
+        lastServerRxTime = now;
+        StaticJsonDocument<512> doc;
+        DeserializationError err = deserializeJson(doc, serverBuf);
+        if (!err && doc["ack"] == "ping") {
+          if (!serverConnected) {
+            serverConnected = true;
+            Serial.println("\n[System] UART1 Handshake with Server Successful!");
+            Serial1.println("{\"cmd\":\"list\"}");
+          }
+        } else {
+          ws.textAll(serverBuf);
+        }
+        serverBuf = "";
+      }
+    } else {
+      if ((c >= 32 && c <= 126) || c == '{' || c == '}') serverBuf += c;
+    }
+    if (serverBuf.length() > 1024) serverBuf = "";
+  }
+
+  uint32_t pingInterval = serverConnected ? 10000 : 2000;
+  if (now - lastPingTime > pingInterval) {
+    Serial1.println("{\"cmd\":\"ping\"}");
+    lastPingTime = now;
+  }
+  if (serverConnected && (now - lastServerRxTime > 15000)) {
+    serverConnected = false;
+    Serial.println("\n[System] Warning: Connection to Mesh Server Lost...");
+  }
+}

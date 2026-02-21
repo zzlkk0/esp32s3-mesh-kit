@@ -1,0 +1,424 @@
+// === web_node/src/main.cpp ===
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Preferences.h> // Include NVS storage library
+
+// Instantiate NVS object
+Preferences preferences;
+
+static const int UART1_TX_PIN = 17;
+static const int UART1_RX_PIN = 18;
+
+const char* AP_SSID = "MeshWeb_AP";
+const char* AP_PASS = "12345678";
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+String pcBuf = "";
+String serverBuf = "";
+bool serverConnected = false;
+uint32_t lastPingTime = 0;
+uint32_t lastServerRxTime = 0;
+uint32_t lastPcInputTime = 0; 
+bool isAPMode = true;
+
+// ========================================================
+// Core Web Page: Embedded in C++ Memory
+// ========================================================
+static const char EMBEDDED_CONSOLE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mesh Smart Hub</title>
+  <style>
+    body { font-family: sans-serif; background: #f0f2f5; margin: 0; padding: 20px; text-align: center; color: #333; }
+    h2 { margin-top: 0; }
+    #status { font-weight: bold; margin-bottom: 15px; padding: 10px; border-radius: 8px; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .broadcast-zone { background: #e3f2fd; padding: 15px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .card { background: #fff; border-radius: 10px; padding: 20px; margin: 15px auto; max-width: 400px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: left; position: relative; }
+    .badge { position: absolute; top: 20px; right: 20px; background: #e9ecef; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+    .online { color: #28a745; font-weight: bold; }
+    .offline { color: #dc3545; font-weight: bold; }
+    button { padding: 10px 20px; border: none; border-radius: 6px; font-size: 15px; cursor: pointer; color: #fff; transition: 0.2s; margin-right: 10px; margin-top: 10px;}
+    button:active { transform: scale(0.95); }
+    .btn-on { background: #28a745; }
+    .btn-off { background: #dc3545; }
+    .btn-action { background: #007bff; }
+    .input-box { width: 70px; padding: 6px; border-radius: 4px; border: 1px solid #ccc; text-align: center; font-size: 14px; }
+    .sensor-panel { display: flex; justify-content: space-around; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: center; border: 1px solid #eee; }
+    .val-text { font-size: 24px; font-weight: bold; margin-top: 5px; }
+    #sensor-log { margin-top: 20px; font-family: monospace; font-size: 12px; background: #333; color: #0f0; padding: 10px; border-radius: 8px; text-align: left; height: 120px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <h2>Mesh Smart Hub</h2>
+  <div id="status">Connecting to Gateway...</div>
+  
+  <div class="broadcast-zone">
+    <h3 style="margin-top:0; font-size:16px;">Global Broadcast Control</h3>
+    <button class="btn-on" onclick="sendCmd({cmd:'switch', id:0, state:1})">All Lights ON</button>
+    <button class="btn-off" onclick="sendCmd({cmd:'switch', id:0, state:0})">All Lights OFF</button>
+    
+    <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed #b6d4fe;">
+      <span style="font-size: 14px; color: #555;">Trigger Duration (ms): </span>
+      <input type="number" id="ms-0" class="input-box" value="500">
+      <button class="btn-action" onclick="triggerButton(0)">Trigger All Access</button>
+    </div>
+  </div>
+
+  <div id="devices"></div>
+  <div id="sensor-log">System Logs...<br></div>
+
+  <script>
+    let ws;
+    let currentList = [];
+    let sensorCache = {}; 
+
+    const statusEl = document.getElementById('status');
+    const devEl = document.getElementById('devices');
+    const logEl = document.getElementById('sensor-log');
+
+    function log(msg) {
+      logEl.innerHTML += msg + '<br>';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function connect() {
+      ws = new WebSocket(`ws://${location.hostname}/ws`);
+      ws.onopen = () => {
+        statusEl.innerHTML = "<span style='color:#28a745'>[Connected] WebSocket Communication Normal</span>";
+        ws.send(JSON.stringify({cmd: 'list'})); 
+      };
+      ws.onclose = () => {
+        statusEl.innerHTML = "<span style='color:#dc3545'>[Disconnected] WebSocket Reconnecting...</span>";
+        setTimeout(connect, 3000);
+      };
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.evt === 'devices' && data.list) {
+            currentList = data.list;
+            renderDevices(currentList);
+          } 
+          else if (data.type === 'report' || data.type === 'ack' || data.type === 'sensor') {
+            log(`[Data Report] ${JSON.stringify(data)}`);
+            let isSensorUpdate = false;
+            if (data.type === 'sensor' && data.data) {
+              sensorCache[data.node || data.id] = data.data;
+              isSensorUpdate = true;
+            } else if (data.type === 'report' && data.deviceType === 'sensor' && data.content) {
+              sensorCache[data.id] = data.content;
+              isSensorUpdate = true;
+            }
+            if (isSensorUpdate && currentList.length > 0) {
+              renderDevices(currentList); 
+            } else {
+              ws.send(JSON.stringify({cmd: 'list'}));
+            }
+          }
+        } catch(err) {
+          log(`[Unknown Data] ${e.data}`);
+        }
+      };
+    }
+
+    function sendCmd(cmdObj) {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify(cmdObj));
+        log(`[Sent Command] ${JSON.stringify(cmdObj)}`);
+      } else {
+        alert("Network not connected, please try again later.");
+      }
+    }
+
+    function triggerButton(id) {
+      let inputEl = document.getElementById('ms-' + id);
+      let msVal = inputEl ? parseInt(inputEl.value) : 500;
+      if (isNaN(msVal) || msVal < 0) msVal = 500; 
+      sendCmd({cmd: 'button', id: id, ms: msVal});
+    }
+
+    function renderDevices(list) {
+      if (list.length === 0) {
+        devEl.innerHTML = "<div class='card'>No devices online in current Mesh network.</div>";
+        return;
+      }
+      let html = "";
+      list.forEach(dev => {
+        html += `<div class="card">`;
+        html += `<span class="badge">${dev.type.toUpperCase()}</span>`;
+        html += `<h3 style="margin-top:0;">Device ID: ${dev.id}</h3>`;
+        html += `<p>Status: ${dev.online ? '<span class="online">Online</span>' : '<span class="offline">Offline</span>'}</p>`;
+        
+        if (dev.type === 'switch') {
+          let isOn = (dev.state === 1);
+          html += `<p>Switch: <strong>${isOn ? 'ON' : 'OFF'}</strong></p>`;
+          html += `<button class="btn-on" onclick="sendCmd({cmd:'switch', id:${dev.id}, state:1})">ON</button>`;
+          html += `<button class="btn-off" onclick="sendCmd({cmd:'switch', id:${dev.id}, state:0})">OFF</button>`;
+        } 
+        else if (dev.type === 'button') {
+          html += `<div style="margin-top:15px; background:#f8f9fa; padding:15px; border-radius:8px; border:1px solid #eee;">`;
+          html += `<span style="font-size: 14px; color: #555;">Trigger Duration (ms): </span>`;
+          html += `<input type="number" id="ms-${dev.id}" class="input-box" value="500">`;
+          html += `<br><button class="btn-action" onclick="triggerButton(${dev.id})">Send Trigger</button>`;
+          html += `</div>`;
+        } 
+        else if (dev.type === 'sensor') {
+          let sData = sensorCache[dev.id];
+          if (sData) {
+            let tStr = (sData.t !== null && sData.t !== undefined) ? sData.t + ' °C' : '--';
+            let hStr = (sData.h !== null && sData.h !== undefined) ? sData.h + ' %' : '--';
+            html += `<div class="sensor-panel">`;
+            html += `  <div><div style="font-size:14px; color:#666;">Temp (T)</div><div class="val-text" style="color:#ff5722;">${tStr}</div></div>`;
+            html += `  <div><div style="font-size:14px; color:#666;">Humi (H)</div><div class="val-text" style="color:#00bcd4;">${hStr}</div></div>`;
+            html += `</div>`;
+          } else {
+            html += `<p style="color:#888; font-style:italic; font-size:14px;">Waiting for sensor report...</p>`;
+          }
+        }
+        html += `</div>`;
+      });
+      devEl.innerHTML = html;
+    }
+    window.onload = connect;
+  </script>
+</body>
+</html>
+)HTML";
+
+// ================== Network Mode Switching (with NVS Memory) ==================
+void setupWiFiAP() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  isAPMode = true;
+  Serial.println("\n[WiFi] Switched to AP Mode (Hotspot)");
+  Serial.print("[WiFi] Hotspot IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setupWiFiSTA(String ssid, String pass, bool save = true) {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  isAPMode = false;
+  
+  Serial.printf("\n[WiFi] Attempting to connect to: %s\n", ssid.c_str());
+  
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 20) {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] STA Connection Successful!");
+    Serial.print("[WiFi] LAN IP: ");
+    Serial.println(WiFi.localIP());
+
+    // Save to Flash only when manually commanded and connected successfully
+    if (save) {
+      preferences.begin("wifi-config", false);
+      preferences.putString("ssid", ssid);
+      preferences.putString("pass", pass);
+      preferences.end();
+      Serial.println("[NVS] WiFi configuration saved permanently.");
+    }
+  } else {
+    Serial.println("\n[WiFi] Connection Failed! Falling back to AP Mode...");
+    setupWiFiAP(); 
+  }
+}
+
+// ================== Independent Text/WiFi Command Processor ==================
+void processPcCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  // Transparently pass JSON to Mesh board
+  if (cmd.startsWith("{") && cmd.endsWith("}")) {
+    Serial.println("\n[PC -> UART1 (JSON Passthrough)] " + cmd);
+    Serial1.println(cmd);
+    return;
+  }
+
+  String cmdLower = cmd;
+  cmdLower.toLowerCase();
+
+  if (cmdLower == "wifi ap") {
+    setupWiFiAP();
+  } 
+  else if (cmdLower == "wifi ip") {
+    Serial.println("\n----- Current Network Status -----");
+    if (isAPMode) {
+      Serial.print("Mode: AP (Hotspot)\nIP: "); Serial.println(WiFi.softAPIP());
+    } else {
+      Serial.print("Mode: STA (External Network)\nIP: "); Serial.println(WiFi.localIP());
+    }
+    Serial.println("-----------------------------------");
+  }
+  else if (cmdLower.startsWith("wifi sta ")) {
+    int spaceIdx = cmd.indexOf(' ', 9); 
+    if (spaceIdx != -1) {
+      String ssid = cmd.substring(9, spaceIdx);
+      String pass = cmd.substring(spaceIdx + 1);
+      ssid.trim(); pass.trim();
+      setupWiFiSTA(ssid, pass, true); // Manual connection, set to save
+    } else {
+      Serial.println("\n[Error] Missing parameters! Usage: wifi sta SSID PASSWORD");
+    }
+  } 
+  else if (cmdLower == "wifi forget") {
+    preferences.begin("wifi-config", false);
+    preferences.clear();
+    preferences.end();
+    Serial.println("\n[NVS] Saved WiFi information cleared.");
+  }
+  else {
+    Serial.println("\n[Blocked] Invalid command or non-JSON format: " + cmd);
+  }
+}
+
+// ================== WebSocket Data Forwarding ==================
+void onEvent(AsyncWebSocket* wsServer, AsyncWebSocketClient* client, AwsEventType type, void* arg, uint8_t* data, size_t len) {
+  (void)wsServer;
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("[WS] Client connected. ID: %u\n", client->id());
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("[WS] Client disconnected.\n");
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      String msg((const char*)data, len);
+      Serial.printf("[Web -> Mesh] %s\n", msg.c_str());
+      Serial1.println(msg); 
+    }
+  }
+}
+
+void setup() {
+  Serial.setRxBufferSize(1024);
+  Serial1.setRxBufferSize(2048);
+  Serial.begin(115200);
+  
+  pcBuf.reserve(512);
+  serverBuf.reserve(2048);
+
+  pinMode(UART1_RX_PIN, INPUT_PULLUP);
+  Serial1.begin(115200, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
+  delay(50);
+  Serial1.flush();
+  Serial1.print("\n\n\n");
+
+  Serial.println("\n\n====================================");
+  Serial.println("  Embedded Web Gateway (NVS Ready) ");
+  Serial.println("====================================");
+
+  // --- NVS Read Logic ---
+  preferences.begin("wifi-config", true); // Open in read-only mode
+  String savedSSID = preferences.getString("ssid", "");
+  String savedPASS = preferences.getString("pass", "");
+  preferences.end();
+
+  if (savedSSID != "" && savedSSID.length() > 0) {
+    Serial.print("[NVS] Found saved WiFi: "); Serial.println(savedSSID);
+    setupWiFiSTA(savedSSID, savedPASS, false); // Auto-connect, don't write to Flash again
+  } else {
+    setupWiFiAP(); 
+  }
+
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", EMBEDDED_CONSOLE_HTML);
+  });
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    request->redirect("/");
+  });
+
+  server.begin();
+  Serial.println("[HTTP] Web Server Ready!");
+}
+
+void loop() {
+  uint32_t now = millis();
+  ws.cleanupClients();
+
+  // ================= Fast Serial Parsing =================
+  while (Serial.available()) {
+    char c = Serial.read();
+    lastPcInputTime = now; 
+    
+    if (c >= 32 && c <= 126) pcBuf += c;
+
+    if (c == '}') {
+      int firstBrace = pcBuf.indexOf('{');
+      if (firstBrace != -1) {
+        String jsonStr = pcBuf.substring(firstBrace);
+        Serial.println("\n[PC -> UART1 (JSON)] " + jsonStr);
+        Serial1.println(jsonStr);
+        pcBuf = ""; 
+        continue;   
+      }
+    }
+
+    if (c == '\n' || c == '\r') {
+      if (pcBuf.length() > 0) {
+        processPcCommand(pcBuf);
+        pcBuf = ""; 
+      }
+    }
+    if (pcBuf.length() > 512) pcBuf = ""; 
+  }
+
+  // Auto-enter (Idle Timeout)
+  if (pcBuf.length() > 0 && (now - lastPcInputTime > 500)) {
+    processPcCommand(pcBuf);
+    pcBuf = "";
+  }
+
+  // ================= Receive Mesh Data =================
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n' || c == '\r') {
+      if (serverBuf.length() > 0) {
+        lastServerRxTime = now;
+        StaticJsonDocument<512> doc;
+        DeserializationError err = deserializeJson(doc, serverBuf);
+        
+        if (!err && doc["ack"] == "ping") {
+          if (!serverConnected) {
+            serverConnected = true;
+            Serial.println("\n[System] UART1 Handshake with Mesh Gateway Successful!");
+            Serial1.println("{\"cmd\":\"list\"}");
+          }
+        } else {
+          ws.textAll(serverBuf);
+        }
+        serverBuf = "";
+      }
+    } else {
+      if ((c >= 32 && c <= 126) || c == '{' || c == '}') serverBuf += c;
+    }
+    if (serverBuf.length() > 2048) serverBuf = "";
+  }
+
+  // Keep-alive Handshake
+  uint32_t pingInterval = serverConnected ? 10000 : 2000;
+  if (now - lastPingTime > pingInterval) {
+    Serial1.println("{\"cmd\":\"ping\"}");
+    lastPingTime = now;
+  }
+  if (serverConnected && (now - lastServerRxTime > 15000)) {
+    serverConnected = false;
+    Serial.println("\n[System] Warning: Connection to Mesh Gateway Lost...");
+  }
+}

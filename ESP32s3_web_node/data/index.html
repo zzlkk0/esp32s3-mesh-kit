@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mesh 控制中心</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h2>Mesh 控制中心</h2>
+  <div class="status-bar">
+    <span class="status-dot" id="ws-dot"></span> <span id="ws-text">WebSocket 未连接</span>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <span class="status-dot" id="mesh-dot"></span> <span id="mesh-text">Mesh 网关未就绪</span>
+  </div>
+  
+  <div class="grid" id="devices-grid">
+    </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

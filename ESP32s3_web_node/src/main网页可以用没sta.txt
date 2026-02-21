@@ -1,0 +1,320 @@
+// === web_node/src/main.cpp ===
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+static const int UART1_TX_PIN = 17;
+static const int UART1_RX_PIN = 18;
+
+const char* AP_SSID = "MeshWeb_AP";
+const char* AP_PASS = "12345678";
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+String pcBuf = "";
+String serverBuf = "";
+bool serverConnected = false;
+uint32_t lastPingTime = 0;
+uint32_t lastServerRxTime = 0;
+
+// ========================================================
+// 核心网页代码：直接嵌入 C++ 内存，绝不白屏
+// 包含 WebSocket 自动重连、JSON 解析和动态卡片生成
+// ========================================================
+static const char EMBEDDED_CONSOLE_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mesh 智能中枢</title>
+  <style>
+    body { font-family: sans-serif; background: #f0f2f5; margin: 0; padding: 20px; text-align: center; color: #333; }
+    h2 { margin-top: 0; }
+    #status { font-weight: bold; margin-bottom: 15px; padding: 10px; border-radius: 8px; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .broadcast-zone { background: #e3f2fd; padding: 15px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .card { background: #fff; border-radius: 10px; padding: 20px; margin: 15px auto; max-width: 400px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: left; position: relative; }
+    .badge { position: absolute; top: 20px; right: 20px; background: #e9ecef; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+    .online { color: #28a745; font-weight: bold; }
+    .offline { color: #dc3545; font-weight: bold; }
+    button { padding: 10px 20px; border: none; border-radius: 6px; font-size: 15px; cursor: pointer; color: #fff; transition: 0.2s; margin-right: 10px; margin-top: 10px;}
+    button:active { transform: scale(0.95); }
+    .btn-on { background: #28a745; }
+    .btn-off { background: #dc3545; }
+    .btn-action { background: #007bff; }
+    .input-box { width: 70px; padding: 6px; border-radius: 4px; border: 1px solid #ccc; text-align: center; font-size: 14px; }
+    .sensor-panel { display: flex; justify-content: space-around; background: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: center; border: 1px solid #eee; }
+    .val-text { font-size: 24px; font-weight: bold; margin-top: 5px; }
+    #sensor-log { margin-top: 20px; font-family: monospace; font-size: 12px; background: #333; color: #0f0; padding: 10px; border-radius: 8px; text-align: left; height: 120px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <h2>Mesh 智能中枢</h2>
+  <div id="status">正在连接网关...</div>
+  
+  <div class="broadcast-zone">
+    <h3 style="margin-top:0; font-size:16px;">全局广播控制</h3>
+    <button class="btn-on" onclick="sendCmd({cmd:'switch', id:0, state:1})">所有灯全开</button>
+    <button class="btn-off" onclick="sendCmd({cmd:'switch', id:0, state:0})">所有灯全关</button>
+    
+    <div style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed #b6d4fe;">
+      <span style="font-size: 14px; color: #555;">触发时长(ms): </span>
+      <input type="number" id="ms-0" class="input-box" value="500">
+      <button class="btn-action" onclick="triggerButton(0)">所有门禁触发</button>
+    </div>
+  </div>
+
+  <div id="devices"></div>
+  <div id="sensor-log">系统日志...<br></div>
+
+  <script>
+    let ws;
+    let currentList = [];
+    let sensorCache = {}; // 核心：用于缓存各个传感器的最新温湿度数据
+
+    const statusEl = document.getElementById('status');
+    const devEl = document.getElementById('devices');
+    const logEl = document.getElementById('sensor-log');
+
+    function log(msg) {
+      logEl.innerHTML += msg + '<br>';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function connect() {
+      ws = new WebSocket(`ws://${location.hostname}/ws`);
+      ws.onopen = () => {
+        statusEl.innerHTML = "<span style='color:#28a745'>[已连接] WebSocket 通讯正常</span>";
+        ws.send(JSON.stringify({cmd: 'list'})); 
+      };
+      ws.onclose = () => {
+        statusEl.innerHTML = "<span style='color:#dc3545'>[已断开] WebSocket 正在重连...</span>";
+        setTimeout(connect, 3000);
+      };
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          
+          if (data.evt === 'devices' && data.list) {
+            currentList = data.list;
+            renderDevices(currentList);
+          } 
+          else if (data.type === 'report' || data.type === 'ack' || data.type === 'sensor') {
+            log(`[数据上报] ${JSON.stringify(data)}`);
+            
+            // === 魔法：拦截传感器数据并更新缓存 ===
+            let isSensorUpdate = false;
+            if (data.type === 'sensor' && data.data) {
+              sensorCache[data.node || data.id] = data.data;
+              isSensorUpdate = true;
+            } else if (data.type === 'report' && data.deviceType === 'sensor' && data.content) {
+              sensorCache[data.id] = data.content;
+              isSensorUpdate = true;
+            }
+
+            // 如果是传感器数据更新，直接无感刷新界面；否则重新请求完整列表
+            if (isSensorUpdate && currentList.length > 0) {
+              renderDevices(currentList); 
+            } else {
+              ws.send(JSON.stringify({cmd: 'list'}));
+            }
+          }
+        } catch(err) {
+          log(`[未知数据] ${e.data}`);
+        }
+      };
+    }
+
+    function sendCmd(cmdObj) {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify(cmdObj));
+        log(`[发送指令] ${JSON.stringify(cmdObj)}`);
+      } else {
+        alert("网络未连接，请稍后再试");
+      }
+    }
+
+    // 专属的按键触发函数，用于读取网页上输入的 ms 时间
+    function triggerButton(id) {
+      let inputEl = document.getElementById('ms-' + id);
+      let msVal = inputEl ? parseInt(inputEl.value) : 500;
+      if (isNaN(msVal) || msVal < 0) msVal = 500; // 容错处理
+      
+      sendCmd({cmd: 'button', id: id, ms: msVal});
+    }
+
+    function renderDevices(list) {
+      if (list.length === 0) {
+        devEl.innerHTML = "<div class='card'>当前 Mesh 网络中暂无设备在线</div>";
+        return;
+      }
+      let html = "";
+      list.forEach(dev => {
+        html += `<div class="card">`;
+        html += `<span class="badge">${dev.type.toUpperCase()}</span>`;
+        html += `<h3 style="margin-top:0;">设备 ID: ${dev.id}</h3>`;
+        html += `<p>网络状态: ${dev.online ? '<span class="online">在线</span>' : '<span class="offline">离线</span>'}</p>`;
+        
+        if (dev.type === 'switch') {
+          let isOn = (dev.state === 1);
+          html += `<p>开关状态: <strong>${isOn ? '已开启' : '已关闭'}</strong></p>`;
+          html += `<button class="btn-on" onclick="sendCmd({cmd:'switch', id:${dev.id}, state:1})">开启</button>`;
+          html += `<button class="btn-off" onclick="sendCmd({cmd:'switch', id:${dev.id}, state:0})">关闭</button>`;
+        } 
+        else if (dev.type === 'button') {
+          html += `<div style="margin-top:15px; background:#f8f9fa; padding:15px; border-radius:8px; border:1px solid #eee;">`;
+          html += `<span style="font-size: 14px; color: #555;">触发时长(ms): </span>`;
+          html += `<input type="number" id="ms-${dev.id}" class="input-box" value="500">`;
+          html += `<br><button class="btn-action" onclick="triggerButton(${dev.id})">发送触发指令</button>`;
+          html += `</div>`;
+        } 
+        else if (dev.type === 'sensor') {
+          // 从缓存中读取这个传感器的最新数据
+          let sData = sensorCache[dev.id];
+          if (sData) {
+            let tStr = (sData.t !== null && sData.t !== undefined) ? sData.t + ' °C' : '--';
+            let hStr = (sData.h !== null && sData.h !== undefined) ? sData.h + ' %' : '--';
+            html += `<div class="sensor-panel">`;
+            html += `  <div><div style="font-size:14px; color:#666;">温度 (T)</div><div class="val-text" style="color:#ff5722;">${tStr}</div></div>`;
+            html += `  <div><div style="font-size:14px; color:#666;">湿度 (H)</div><div class="val-text" style="color:#00bcd4;">${hStr}</div></div>`;
+            html += `</div>`;
+          } else {
+            html += `<p style="color:#888; font-style:italic; font-size:14px;">正在等待传感器上报实时数据...</p>`;
+          }
+        }
+        
+        html += `</div>`;
+      });
+      devEl.innerHTML = html;
+    }
+
+    window.onload = connect;
+  </script>
+</body>
+</html>
+)HTML";
+
+void setupWiFiAP() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.println("\n[WiFi] AP Mode Started");
+  Serial.print("[WiFi] IP Address: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+// ================== WebSocket 数据转发 ==================
+void onEvent(AsyncWebSocket* wsServer, AsyncWebSocketClient* client, AwsEventType type,
+             void* arg, uint8_t* data, size_t len) {
+  (void)wsServer;
+  if (type == WS_EVT_CONNECT) {
+    Serial.printf("[WS] Client connected. ID: %u\n", client->id());
+  } else if (type == WS_EVT_DISCONNECT) {
+    Serial.printf("[WS] Client disconnected.\n");
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo* info = (AwsFrameInfo*)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      String msg((const char*)data, len);
+      Serial.printf("[Web -> Mesh] %s\n", msg.c_str());
+      Serial1.println(msg); // 透传给 Mesh 节点
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(UART1_RX_PIN, INPUT_PULLUP);
+  Serial1.begin(115200, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
+  delay(50);
+  Serial1.flush();
+  Serial1.print("\n\n\n");
+
+  Serial.println("\n\n====================================");
+  Serial.println("  Embedded Web Dashboard Gateway ");
+  Serial.println("====================================");
+
+  setupWiFiAP();
+
+  // 1. 注册 WebSocket
+  ws.onEvent(onEvent);
+  server.addHandler(&ws);
+
+  // 2. 将根目录直接指向内置的 HTML，彻底抛弃文件系统
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", EMBEDDED_CONSOLE_HTML);
+  });
+
+  // 3. 拦截 favicon 请求
+  server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "image/x-icon", "");
+  });
+
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    request->redirect("/"); // 找不到路径时，强制回到主页
+  });
+
+  server.begin();
+  Serial.println("[HTTP] Web Server is fully ready!");
+}
+
+void loop() {
+  uint32_t now = millis();
+  ws.cleanupClients();
+
+  // 读取电脑串口 (调试用)
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (pcBuf.length()) {
+        pcBuf.trim();
+        Serial1.println(pcBuf);
+        pcBuf = "";
+      }
+    } else {
+      pcBuf += c;
+    }
+  }
+
+  // 读取 Mesh 节点发来的数据，并广播给所有网页
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n' || c == '\r') {
+      if (serverBuf.length() > 0) {
+        lastServerRxTime = now;
+        
+        StaticJsonDocument<512> doc;
+        DeserializationError err = deserializeJson(doc, serverBuf);
+        
+        if (!err && doc["ack"] == "ping") {
+          // 拦截心跳包
+          if (!serverConnected) {
+            serverConnected = true;
+            Serial.println("\n[System] UART1 Handshake with Server Successful!");
+            Serial1.println("{\"cmd\":\"list\"}");
+          }
+        } else {
+          // 将 Mesh 网络的有效数据推送给网页
+          ws.textAll(serverBuf);
+        }
+        serverBuf = "";
+      }
+    } else {
+      if ((c >= 32 && c <= 126) || c == '{' || c == '}') serverBuf += c;
+    }
+    if (serverBuf.length() > 2048) serverBuf = "";
+  }
+
+  // 维持与 Mesh 节点的心跳
+  uint32_t pingInterval = serverConnected ? 10000 : 2000;
+  if (now - lastPingTime > pingInterval) {
+    Serial1.println("{\"cmd\":\"ping\"}");
+    lastPingTime = now;
+  }
+  if (serverConnected && (now - lastServerRxTime > 15000)) {
+    serverConnected = false;
+    Serial.println("\n[System] Warning: Connection to Mesh Server Lost...");
+  }
+}
